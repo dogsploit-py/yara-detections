@@ -1,21 +1,27 @@
 /*
- * detect.c — Rusty stealer (grabber_rs) detector
- * ==============================================
+ * detect.c — Rusty stealer (grabber_rs) detector (v5, ROP-based)
+ * =================================================
  *
- * Detects the "rusty stealer" family (Rust, crate name grabber_rs) by static
- * file signatures derived from the recovered source tree in this directory
- * (src/main.rs, src/global/utils.rs, src/evasion/, ...).
+ * v5: the string-IOC signatures (C2 domains, endpoints, crate paths,
+ * protocol labels, hardcoded secrets, target strings) are removed. This
+ * project is about ROP, not string detection. The file scan now reports
+ * two things:
  *
- * The family exfiltrates browser credentials and Discord tokens to a Discord
- * webhook as a deflated JSON file ("deflated_data.txt"), kills
- * DiscordTokenProtector, and hides its console window. Persistence exists in
- * source but is commented out, so there are no reliable on-disk artifacts.
+ *   1. known-sample match: SHA-256 of the analysed rusty stealer samples
+ *      (exact family attribution for those files);
+ *   2. ROP structural capability, mirroring the SRIDE paper's byte layer
+ *      (Rule 1): >=3 distinct POP;RET spine gadgets + >=1 chain terminator
+ *      + a spine gadget within +/-256 bytes of a stack-pivot occurrence,
+ *      gated on the PE magic. This is a HUNTING-TIER capability signal —
+ *      the paper's null-model control (Section 7.5) shows gadget-only
+ *      conjunctions fire on structureless bytes at base rate on large
+ *      files, so it is reported as "suspicious", never as a verdict.
  *
- * IMPORTANT: release builds wrap most strings in obfstr!() macros (XOR at
- * compile time), so plaintext signatures mainly match debug/unobfuscated
- * builds, memory dumps after string decryption, and the source tree itself.
- * The crate-fingerprint signatures (rare browser names, DiscordTokenProtector
- * artefacts, webhook avatar URLs) are the most reliable across builds.
+ * Live system checks (Windows) are unchanged: they look for the family's
+ * persistence/process artifacts, which are behavioural, not strings.
+ *
+ * The analysed samples (reverse engineering):
+ * (none yet — no verified binary sample is available for this family)
  *
  * NOTE: prysmaxstealer/rustystealer.exe in the sibling directory is NOT this
  * family despite its filename — it is a Prysmax build. Use
@@ -43,6 +49,7 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <tlhelp32.h>
 #else
 #include <dirent.h>
 #include <sys/stat.h>
@@ -145,35 +152,59 @@ static void sha256_final(sha256_ctx *c, uint8_t out[32]) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Boyer–Moore–Horspool substring search                              */
+/* Boyer–Moore–Horspool offset search                                 */
 /* ------------------------------------------------------------------ */
 
-static int find_bytes(const uint8_t *hay, size_t haylen,
-                      const uint8_t *needle, size_t nlen) {
+/* Collect all occurrence offsets of needle in hay. Returns the count;
+ * *out receives a malloc'd array (NULL when count == 0). Caller frees. */
+static size_t find_offsets(const uint8_t *hay, size_t haylen,
+                           const uint8_t *needle, size_t nlen,
+                           size_t **out) {
     size_t shift[256];
-    size_t i, last;
-    if (nlen == 0) return 1;
-    if (haylen < nlen) return 0;
+    size_t i, last, count = 0, cap = 0;
+    size_t *offs = NULL;
+    *out = NULL;
+    if (nlen == 0 || haylen < nlen) return 0;
     for (i = 0; i < 256; i++) shift[i] = nlen;
     for (i = 0; i < nlen - 1; i++) shift[needle[i]] = nlen - 1 - i;
     last = nlen - 1;
     i = 0;
     while (i + nlen <= haylen) {
         if (hay[i + last] == needle[last] &&
-            memcmp(hay + i, needle, nlen) == 0)
-            return 1;
+            memcmp(hay + i, needle, nlen) == 0) {
+            if (count == cap) {
+                size_t ncap = cap ? cap * 2 : 256;
+                size_t *tmp = (size_t *)realloc(offs, ncap * sizeof *tmp);
+                if (!tmp) { free(offs); return 0; }
+                offs = tmp;
+                cap = ncap;
+            }
+            offs[count++] = i;
+        }
         i += shift[hay[i + last]];
+    }
+    *out = offs;
+    return count;
+}
+
+/* Two sorted offset lists: is any pair within +/-256 bytes? */
+static int any_within_256(const size_t *a, size_t na, const size_t *b, size_t nb) {
+    size_t i = 0, j = 0;
+    while (i < na && j < nb) {
+        size_t x = a[i], y = b[j];
+        if (y + 256 < x) { j++; continue; }
+        if (x + 256 < y) { i++; continue; }
+        return 1;
     }
     return 0;
 }
 
 /* ------------------------------------------------------------------ */
-/* Rusty stealer (grabber_rs) IOCs                                    */
+/* Myth known samples + ROP structural patterns                       */
 /* ------------------------------------------------------------------ */
 
-/* No verified binary sample is available for this family — the IOCs below
- * come from the recovered source tree. Add known sample hashes here when
- * available. */
+/* No verified binary sample is available for this family. Add known
+ * sample hashes here when available. */
 static const char *KNOWN_HASHES[] = {
     NULL
 };
@@ -182,45 +213,39 @@ typedef struct {
     const char    *name;
     const uint8_t *pat;
     size_t         plen;
-    int            weight;
-} sig_t;
+} rpat_t;
 
-#define SIGSTR(n, s, w) { n, (const uint8_t *)(s), sizeof(s) - 1, w }
-
-static const sig_t SIGS[] = {
-    /* --- exfiltration --- */
-    SIGSTR("webhook exfil filename 'deflated_data.txt'", "deflated_data.txt", 3),
-    SIGSTR("webhook config placeholder 'WEBHOOK_HERE'", "WEBHOOK_HERE", 2),
-    SIGSTR("hardcoded webhook avatar i.redd.it/bm6dj3i51gd71.png",
-           "https://i.redd.it/bm6dj3i51gd71.png", 2),
-    SIGSTR("hardcoded embed footer image (user-images 231858967-7c37bf1e...)",
-           "231858967-7c37bf1e-335b-4f5a-9760-da97be9f54bb", 2),
-    SIGSTR("victim IP probe ipv4.icanhazip.com", "https://ipv4.icanhazip.com", 1),
-
-    /* --- DiscordTokenProtector kill-list --- */
-    SIGSTR("kills \\DiscordTokenProtector.exe", "\\DiscordTokenProtector.exe", 2),
-    SIGSTR("deletes \\ProtectionPayload.dll", "\\ProtectionPayload.dll", 2),
-    SIGSTR("deletes \\secure.dat", "\\secure.dat", 1),
-
-    /* --- crate / build fingerprints --- */
-    SIGSTR("crate name 'grabber_rs'", "grabber_rs", 2),
-    SIGSTR("goldberg obfuscation crate", "goldberg-0.1", 1),
-    SIGSTR("deflate crate (exfil compression)", "deflate-1.0", 1),
-
-    /* --- rare browser targets (distinctive as a group) --- */
-    SIGSTR("rare browser target kometa.exe", "kometa.exe", 1),
-    SIGSTR("rare browser target orbitum.exe", "orbitum.exe", 1),
-    SIGSTR("rare browser target epicprivacybrowser.exe",
-           "epicprivacybrowser.exe", 1),
-    SIGSTR("rare browser target uran.exe", "uran.exe", 1),
-
-    /* --- AV/VM evasion probes --- */
-    SIGSTR("Cynet evasion probe CynetMS.exe", "CynetMS.exe", 1),
+/* Stack pivots. Two-byte forms only: the single byte 0x94 (XCHG EAX,ESP)
+ * degenerates matching and is guarded out, as in the paper's rules. */
+static const rpat_t ROP_PIVOTS[] = {
+    { "MOV ESP,EAX",  (const uint8_t []){ 0x89, 0xC4 }, 2 },
+    { "POP ESP;RET",  (const uint8_t []){ 0x5C, 0xC3 }, 2 },
+    { "PUSH EAX;RET", (const uint8_t []){ 0x50, 0xC3 }, 2 },
 };
 
-#define NUM_SIGS (sizeof(SIGS) / sizeof(SIGS[0]))
+/* Register-load dispatch spine (POP r32;RET) */
+static const rpat_t ROP_SPINE[] = {
+    { "POP EAX;RET", (const uint8_t []){ 0x58, 0xC3 }, 2 },
+    { "POP ECX;RET", (const uint8_t []){ 0x59, 0xC3 }, 2 },
+    { "POP EDX;RET", (const uint8_t []){ 0x5A, 0xC3 }, 2 },
+    { "POP EBX;RET", (const uint8_t []){ 0x5B, 0xC3 }, 2 },
+    { "POP ESI;RET", (const uint8_t []){ 0x5E, 0xC3 }, 2 },
+    { "POP EDI;RET", (const uint8_t []){ 0x5F, 0xC3 }, 2 },
+};
 
-/* verdict thresholds */
+/* Chain terminators (chainable forms) */
+static const rpat_t ROP_TERMS[] = {
+    { "CALL EAX",    (const uint8_t []){ 0xFF, 0xD0 },      2 },
+    { "JMP EAX",     (const uint8_t []){ 0xFF, 0xE0 },      2 },
+    { "CALL ESI",    (const uint8_t []){ 0xFF, 0xD6 },      2 },
+    { "SYSCALL;RET", (const uint8_t []){ 0x0F, 0x05, 0xC3 }, 3 },
+};
+
+#define N_PIVOTS (sizeof(ROP_PIVOTS) / sizeof(ROP_PIVOTS[0]))
+#define N_SPINE  (sizeof(ROP_SPINE)  / sizeof(ROP_SPINE[0]))
+#define N_TERMS  (sizeof(ROP_TERMS)  / sizeof(ROP_TERMS[0]))
+
+/* verdict thresholds (live checks) */
 #define SCORE_DETECT     4
 #define SCORE_SUSPICIOUS 2
 
@@ -246,8 +271,8 @@ static void scan_file(const char *path) {
     FILE *f = fopen(path, "rb");
     uint8_t *buf;
     long sz;
-    int score = 0;
     int hash_hit = 0;
+    int rop_match = 0;
     size_t i;
 
     if (!f) {
@@ -295,26 +320,62 @@ static void scan_file(const char *path) {
 
     printf("[SCAN] %s (%ld bytes)\n", path, sz);
 
-    if (hash_hit) {
+    if (hash_hit)
         printf("       SHA-256 matches known grabber_rs sample\n");
-        score = 100;
-    }
 
-    for (i = 0; i < NUM_SIGS; i++) {
-        if (find_bytes(buf, (size_t)sz, SIGS[i].pat, SIGS[i].plen)) {
-            printf("       sig hit (+%d): %s\n", SIGS[i].weight, SIGS[i].name);
-            score += SIGS[i].weight;
+    /* ROP structural scan — PE files only (MZ gate), mirroring the paper's
+     * generic rule: >=3 distinct spine gadgets, >=1 terminator, and a spine
+     * gadget within +/-256 bytes of a pivot occurrence. */
+    if ((size_t)sz >= 2 && buf[0] == 'M' && buf[1] == 'Z') {
+        size_t *piv_offs[N_PIVOTS], *spn_offs[N_SPINE];
+        size_t piv_n[N_PIVOTS], spn_n[N_SPINE];
+        int any_pivot = 0, spine_kinds = 0, any_term = 0, prox = 0;
+        size_t k, m;
+
+        for (k = 0; k < N_PIVOTS; k++) {
+            piv_n[k] = find_offsets(buf, (size_t)sz, ROP_PIVOTS[k].pat,
+                                    ROP_PIVOTS[k].plen, &piv_offs[k]);
+            if (piv_n[k]) any_pivot = 1;
         }
+        for (k = 0; k < N_SPINE; k++) {
+            spn_n[k] = find_offsets(buf, (size_t)sz, ROP_SPINE[k].pat,
+                                    ROP_SPINE[k].plen, &spn_offs[k]);
+            if (spn_n[k]) spine_kinds++;
+        }
+        for (k = 0; k < N_TERMS && !any_term; k++) {
+            size_t *tmp = NULL;
+            size_t n = find_offsets(buf, (size_t)sz, ROP_TERMS[k].pat,
+                                    ROP_TERMS[k].plen, &tmp);
+            free(tmp);
+            if (n) any_term = 1;
+        }
+        if (any_pivot && spine_kinds) {
+            for (k = 0; k < N_PIVOTS && !prox; k++)
+                for (m = 0; m < N_SPINE && !prox; m++)
+                    if (piv_n[k] && spn_n[m] &&
+                        any_within_256(piv_offs[k], piv_n[k],
+                                       spn_offs[m], spn_n[m]))
+                        prox = 1;
+        }
+        rop_match = any_pivot && spine_kinds >= 3 && any_term && prox;
+
+        for (k = 0; k < N_PIVOTS; k++) free(piv_offs[k]);
+        for (k = 0; k < N_SPINE; k++) free(spn_offs[k]);
+
+        if (rop_match)
+            printf("       ROP structural capability: pivot co-located with "
+                   "%d spine kinds + terminator\n", spine_kinds);
     }
 
-    if (score >= SCORE_DETECT) {
-        printf("[DETECT] %s: rusty stealer / grabber_rs (score %d)\n", path, score);
+    if (hash_hit) {
+        printf("[DETECT] %s: rusty stealer / grabber_rs (known sample, SHA-256)\n", path);
         if (g_worst < 2) g_worst = 2;
-    } else if (score >= SCORE_SUSPICIOUS) {
-        printf("[SUSP ] %s: possible grabber_rs variant (score %d)\n", path, score);
+    } else if (rop_match) {
+        printf("[SUSP ] %s: ROP structural capability — hunting-tier signal, "
+               "not a confirmed chain\n", path);
         if (g_worst < 1) g_worst = 1;
     } else {
-        printf("[CLEAN] %s (score %d)\n", path, score);
+        printf("[CLEAN] %s\n", path);
     }
 
     free(buf);
@@ -433,7 +494,6 @@ static int live_checks(void) {
     return 0;
 #endif
 }
-
 /* ------------------------------------------------------------------ */
 
 int main(int argc, char **argv) {
@@ -441,7 +501,7 @@ int main(int argc, char **argv) {
 
     if (argc < 2) {
         fprintf(stderr,
-            "Rusty stealer (grabber_rs) detector\n"
+            "Rusty stealer (grabber_rs) detector (v5: known-sample hash + ROP structural scan)\n"
             "usage:\n"
             "  %s <file> [file...]  scan file(s)\n"
             "  %s <dir>             scan directory recursively\n"
